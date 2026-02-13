@@ -65,3 +65,7 @@ invoice_gold = (invoice_financials
 # --- STEP 7: Save to Gold Table for Analytics ---
 # Create the schema and save the validated data to a managed table [6]
 spark.sql("CREATE SCHEMA IF NOT EXISTS gold")
+
+# ---steps 8: Saving the table 
+then write into gold table or layer
+invoice_gold.write.mode("overwrite).saveAsTable("gold_invoive.gold")

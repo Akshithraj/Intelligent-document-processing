@@ -1,0 +1,71 @@
+from pyspark.sql.functions import col, explode, from_json, variant_get, lower, regexp_replace, regexp_extract, abs, when, max, coalesce
+
+# --- STEP 1: Ingest PDF Files from Databricks Volume ---
+# Define the path to your raw invoice volume [1]
+base_path = "/Volumes/default/workspace/raw_invoices"
+
+# Read binary PDF files into a Spark DataFrame [8]
+raw_df = (spark.read.format("binaryFile")
+          .option("pathGlobFilter", "*.pdf")
+          .load(base_path)
+          .select("path", "content", "length", "modificationTime"))
+
+# --- STEP 2: Parse Documents using AI Parse Document ---
+# The AI Parse Document function extracts structured information from binary PDFs [2, 9]
+parsed_df = raw_df.select("path", ai_parse_document(col("content")).alias("parsed_document"))
+
+# --- STEP 3: Extract Element Arrays from JSON ---
+# Extract the 'elements' array from the parsed document structure [10, 11]
+elements_json_df = parsed_df.select(
+    "path", 
+    variant_get(col("parsed_document"), "$.document.elements", "string").alias("elements_json")
+)
+
+# Define the schema for the elements within the JSON [3, 11]
+element_schema = "array<struct<id:string, type:string, content:string, page_id:int, bbox:array<float>, description:string>>"
+
+# Explode the JSON array into individual rows and columns [3, 12]
+elements_df = (elements_json_df
+               .withColumn("e", explode(from_json(col("elements_json"), element_schema)))
+               .select("path",
+                       col("e.id").alias("element_id"),
+                       col("e.type").alias("element_type"),
+                       col("e.content").alias("content")))
+
+# --- STEP 4: Data Cleaning and Field Extraction ---
+# Remove HTML tags, handle white spaces, and convert content to lowercase for extraction [4, 13]
+cleaned_elements_df = elements_df.withColumn(
+    "content_clean",
+    lower(regexp_replace(regexp_replace(col("content"), "<[^>]*>", " "), "\\s+", " "))
+)
+
+# Use Regular Expressions to extract monetary fields and amounts [4, 14]
+# Key fields include subtotal, shipping, tax, and various 'total' labels [4, 15]
+invoice_amounts = cleaned_elements_df.select(
+    "path",
+    regexp_extract(col("content_clean"), "(subtotal|shipping|tax|total due|amount due|balance_due)", 1).alias("field"),
+    regexp_extract(col("content_clean"), r"(\d+\.?\d*)", 1).cast("double").alias("amount")
+).filter(col("field") != "")
+
+# --- STEP 5: Pivot Data for Financial Reporting ---
+# Transform row-based fields into columns for each invoice [16, 17]
+invoice_financials = (invoice_amounts
+                      .groupBy("path")
+                      .pivot("field", ["subtotal", "shipping", "tax", "total due", "amount due", "balance due"])
+                      .agg(max("amount")))
+
+# --- STEP 6: Validation Logic ---
+# Calculate the total manually and compare it with the extracted total to ensure OCR accuracy [5, 17]
+invoice_gold = (invoice_financials
+                .withColumn("extracted_total", coalesce(col("total due"), col("amount due"), col("balance due")))
+                .withColumn("calculated_total", col("subtotal") + col("shipping") + col("tax"))
+                .withColumn("diff", abs(col("calculated_total") - col("extracted_total")))
+                .withColumn("status", when(col("diff") < 0.05, "True").otherwise("False")))
+
+# --- STEP 7: Save to Gold Table for Analytics ---
+# Create the schema and save the validated data to a managed table [6]
+spark.sql("CREATE SCHEMA IF NOT EXISTS gold")
+
+# ---steps 8: Saving the table 
+then write into gold table or layer
+invoice_gold.write.mode("overwrite).saveAsTable("gold_invoive.gold")
